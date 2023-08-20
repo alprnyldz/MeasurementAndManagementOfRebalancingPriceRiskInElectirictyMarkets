@@ -1,0 +1,1292 @@
+import os
+import seaborn as sns
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from scipy.stats.mstats import winsorize
+from functools import reduce
+import xml.etree.ElementTree as ET
+import pandas as pd
+import requests
+from dateutil.parser import parse
+from datetime import datetime, timedelta
+import io
+import zipfile
+
+main_path = ""
+TOKEN = "EnterToken"
+base_url = "https://web-api.tp.entsoe.eu/api?"
+
+psrTypes = {
+    "Solar": "B16",
+    "Wind Offshore": "B18",
+    "Wind Onshore": "B19",
+    "Generation": "A04",
+    "Load": "A05",
+}
+
+processTypes = {
+    "DayAhead": "A01",
+    "IntradayProcess": "A40",
+    "Realised": "A16",
+}
+
+documentTypes = {
+    "Wind and solar forecast": "A69",
+    "Actual generation per type": "A75",
+    "System total load": "A65",
+    "Price Document": "A44",
+    "Imbalance prices": "A85",
+    "Imbalance volume": "A86",
+}
+
+areas = {
+    "Germany": "10Y1001A1001A82H",
+    "Netherlands": "10YNL----------L",
+    "France": "10YFR-RTE------C",
+    "GreatBritain": "10YGB----------A",
+    "Belgium": "10YBE----------2",
+    "Switzerland": "10YCH-SWISSGRIDZ",
+    "Spain": "10YES-REE------0",
+    "Austria": "10YAT-APG------L",
+    "Italy": "10YIT-GRTN-----B",
+    "Portugal": "10YPT-REN------W",
+    "Romania": "10YRO-TEL------P",
+    "Lithuania": "10YLT-1001A0008Q",
+    "Hungary": "10YHU-MAVIR----U",
+    "Finland": "10YFI-1--------U",
+    "Estonia": "10Y1001A1001A39I",
+    "Denmark1": "10YDK-1--------W",
+    "Denmark2": "10YDK-2--------M",
+    "Ireland": "10Y1001A1001A59C"
+}
+
+
+def xml_to_df_ImbalancePrices(xml_data):
+    # Initialize a list to store each row of the DataFrame
+    data = []
+    # Parse XML
+    root = ET.fromstring(xml_data)
+    # Dynamically retrieve the namespace from the root tag
+    ns_str = root.tag.split('}')[0].strip('{')
+    ns = {'main': ns_str}
+    # Iterate over TimeSeries/Period data
+    for ts in root.findall('.//main:TimeSeries', ns):
+        for period in ts.findall('main:Period', ns):
+            time_Interval = period.find('main:timeInterval', ns)
+            start = parse(time_Interval.find('main:start', ns).text)
+            resolution = period.find('main:resolution', ns).text
+            for pt in period.findall('main:Point', ns):
+                position = int(pt.find('main:position', ns).text)
+                value = float(pt.find('main:imbalance_Price.amount', ns).text)
+                imbalancePriceCategory = pt.find('main:imbalance_Price.category', ns).text
+                row = {
+                    'quantity': value,
+                    'imbalancePriceCategory': imbalancePriceCategory
+                }
+                if resolution == "PT15M":
+                    timestamp = start + timedelta(minutes=(int(position) - 1) * 15)
+                    row['timestamp'] = timestamp
+                    data.append(row)
+                elif resolution == "PT30M":
+                    for i in range(2):
+                        timestamp = start + timedelta(minutes=((int(position) - 1) * 30) + i * 15)
+                        row['timestamp'] = timestamp
+                        data.append(row.copy())
+                elif resolution == "PT60M":
+                    for i in range(4):
+                        timestamp = start + timedelta(minutes=((int(position) - 1) * 60) + i * 15)
+                        row['timestamp'] = timestamp
+                        data.append(row.copy())
+    # Convert the list of rows into a DataFrame
+    df = pd.DataFrame(data)
+    if len(df) == 0:
+        print("No Imbalance Prices")
+        return df
+    # Pivot the DataFrame using 'timestamp' as the index and 'imbalancePriceCategory' as columns
+    pivot_df = df.pivot(index='timestamp', columns='imbalancePriceCategory', values='quantity')
+    # Rename columns
+    pivot_df = pivot_df.rename(columns={"A04": "quantity_Generation", "A05": "quantity_Load"})
+    pivot_df = pivot_df.reset_index()
+    return pivot_df
+
+
+def xml_to_df_ImbalanceVolumes(xml_data):
+    # Initialize a list to store each row of the DataFrame
+    data = []
+
+    # Parse XML
+    root = ET.fromstring(xml_data)
+
+    # Dynamically retrieve the namespace from the root tag
+    ns_str = root.tag.split('}')[0].strip('{')
+    ns = {'main': ns_str}
+
+    # Iterate over TimeSeries/Period data
+    for ts in root.findall('.//main:TimeSeries', ns):
+
+        if ts.find('main:flowDirection.direction', ns) is not None:
+            flowDirection_direction = ts.find('main:flowDirection.direction', ns).text
+        else:
+            flowDirection_direction = None
+        quantity_Measure_Unit_name = ts.find('main:quantity_Measure_Unit.name', ns).text
+
+        for period in ts.findall('main:Period', ns):
+            time_Interval = period.find('main:timeInterval', ns)
+            start = parse(time_Interval.find('main:start', ns).text)
+            # end = parse(time_Interval.find('main:end', ns).text)
+            resolution = period.find('main:resolution', ns).text
+
+            for pt in period.findall('main:Point', ns):
+                position = int(pt.find('main:position', ns).text)
+                if flowDirection_direction == 'A02':  # Deficit
+                    value = -float(pt.find('main:quantity', ns).text)
+                elif flowDirection_direction == 'A01':  # Surplus
+                    value = float(pt.find('main:quantity', ns).text)
+                else:
+                    value = float(pt.find('main:quantity', ns).text)
+
+                if resolution == "PT15M":
+                    timestamp = start + timedelta(minutes=int(position) * 15 - 15)
+                    row = {
+                        'quantity': value,
+                        'timestamp': timestamp
+                    }
+                    data.append(row)
+                elif resolution == "PT30M":
+                    for i in range(2):
+                        timestamp = start + timedelta(minutes=((int(position) - 1) * 30) + i * 15)
+                        if quantity_Measure_Unit_name == 'MWH':
+                            row = {
+                                'quantity': value / 2,
+                                'timestamp': timestamp
+                            }
+                        elif quantity_Measure_Unit_name == 'MW':
+                            row = {
+                                'quantity': value,
+                                'timestamp': timestamp
+                            }
+                        data.append(row)
+                elif resolution == "PT60M":
+                    for i in range(4):
+                        timestamp = start + timedelta(minutes=((int(position) - 1) * 60) + i * 15)
+                        if quantity_Measure_Unit_name == 'MWH':
+                            row = {
+                                'quantity': value / 4,
+                                'timestamp': timestamp
+                            }
+                        elif quantity_Measure_Unit_name == 'MW':
+                            row = {
+                                'quantity': value,
+                                'timestamp': timestamp
+                            }
+                        data.append(row)
+    # Convert the list of rows into a DataFrame
+    df = pd.DataFrame(data)
+    if len(df) == 0:
+        print("No imbalance volume")
+        return df
+    return df
+
+
+def xml_to_df(xml_data):
+    # Initialize a list to store each row of the DataFrame
+    data = []
+
+    # Parse XML
+    root = ET.fromstring(xml_data)
+
+    # Dynamically retrieve the namespace from the root tag
+    ns_str = root.tag.split('}')[0].strip('{')
+    ns = {'main': ns_str}
+
+    # Extract time period interval
+    # time_Period = root.find('main:time_Period.timeInterval', ns)
+    # start = datetime.fromisoformat(time_Period.find('main:start', ns).text.replace('Z', '+00:00'))
+    # end = datetime.fromisoformat(time_Period.find('main:end', ns).text.replace('Z', '+00:00'))
+
+    # Extract other root elements
+    # mRID = root.find('mRID').text
+    # revisionNumber = root.find('main:revisionNumber', ns).text
+
+    # doc_type = root.find('main:type', ns).text
+    # processType = root.find('main:process.processType', ns).text
+    # createdDateTime = root.find('main:createdDateTime', ns).text
+
+    # sender_mRID = root.find('main:sender_MarketParticipant.mRID', ns).text
+    # sender_codingScheme = root.find('main:sender_MarketParticipant.mRID', ns).get('codingScheme')
+    # sender_marketRole_type = root.find('main:sender_MarketParticipant.marketRole.type', ns).text
+    # receiver_mRID = root.find('main:receiver_MarketParticipant.mRID', ns).text
+    # receiver_codingScheme = root.find('main:receiver_MarketParticipant.mRID', ns).get('codingScheme')
+    # receiver_marketRole_type = root.find('main:receiver_MarketParticipant.marketRole.type', ns).text
+    # createdDateTime = parse(root.find('main:createdDateTime', ns).text)
+
+    # Iterate over TimeSeries/Period data
+    for ts in root.findall('.//main:TimeSeries', ns):
+        # ts_mRID = ts.find('mRID').text
+        # businessType = ts.find('main:businessType', ns).text
+        # objectAggregation = ts.find('main:objectAggregation', ns).text
+        # outBiddingZone_Domain_mRID = ts.find('main:outBiddingZone_Domain.mRID', ns).text
+
+        # Check if the field exists, and handle different possible field names
+        if ts.find('main:outBiddingZone_Domain.mRID', ns) is not None:
+            biddingZone_Domain_mRID = ts.find('main:outBiddingZone_Domain.mRID', ns).text
+        elif ts.find('main:inBiddingZone_Domain.mRID', ns) is not None:
+            biddingZone_Domain_mRID = ts.find('main:inBiddingZone_Domain.mRID', ns).text
+        else:
+            biddingZone_Domain_mRID = None
+
+        # outBiddingZone_Domain_codingScheme = ts.find('main:outBiddingZone_Domain.mRID', ns).get('codingScheme')
+        # quantity_Measure_Unit_name = ts.find('main:quantity_Measure_Unit.name', ns).text
+        # curveType = ts.find('main:curveType', ns).text
+
+        for period in ts.findall('main:Period', ns):
+            time_Interval = period.find('main:timeInterval', ns)
+            start = parse(time_Interval.find('main:start', ns).text)
+            # end = parse(time_Interval.find('main:end', ns).text)
+            resolution = period.find('main:resolution', ns).text
+
+            for pt in period.findall('main:Point', ns):
+                position = int(pt.find('main:position', ns).text)
+                if pt.find('main:quantity', ns) is not None:
+                    value = float(pt.find('main:quantity', ns).text)
+                elif pt.find('main:price.amount', ns) is not None:
+                    value = float(pt.find('main:price.amount', ns).text)
+                else:
+                    Exception()
+
+                # Add to DataFrame
+                row = {
+                    # 'mRID': mRID,
+                    # 'revisionNumber': revisionNumber,
+                    # 'type': doc_type,
+                    # 'processType': processType,
+                    # 'sender_mRID': sender_mRID,
+                    # 'sender_codingScheme': sender_codingScheme,
+                    # 'sender_marketRole_type': sender_marketRole_type,
+                    # 'receiver_mRID': receiver_mRID,
+                    # 'receiver_codingScheme': receiver_codingScheme,
+                    # 'receiver_marketRole_type': receiver_marketRole_type,
+                    # 'createdDateTime': createdDateTime,
+                    # 'start_time_period': start_time_period,
+                    # 'end_time_period': end_time_period, 'TimeSeries_mRID': ts_mRID,
+                    # 'businessType': businessType,
+                    # 'objectAggregation': objectAggregation,
+                    # 'outBiddingZone_Domain_mRID': outBiddingZone_Domain_mRID,
+                    # 'biddingZone_Domain_mRID': biddingZone_Domain_mRID,
+                    # 'outBiddingZone_Domain_codingScheme': outBiddingZone_Domain_codingScheme,
+                    # 'quantity_Measure_Unit_name': quantity_Measure_Unit_name,
+                    # 'curveType': curveType,
+                    # 'Period_start': start,
+                    # 'Period_end': end,
+                    # 'resolution': resolution,
+                    # 'position': position,
+                    'quantity': value
+                }
+
+                if resolution == "PT15M":
+                    timestamp = start + timedelta(minutes=int(position) * 15 - 15)
+                    row['timestamp'] = timestamp
+                    data.append(row)
+                elif resolution == "PT60M":
+                    for i in range(4):
+                        timestamp = start + timedelta(minutes=((int(position) - 1) * 60) + i * 15)
+                        row['timestamp'] = timestamp
+                        data.append(row.copy())
+    # Convert the list of rows into a DataFrame
+    df = pd.DataFrame(data)
+
+    return df
+
+
+def fetch_data_from_ENTSOE(parameters, periodStart="202001010000", periodEnd="202306010000"):
+    os.chdir("/Users/alpereny/PycharmProjects/Thesis")
+
+    # Makes the request to ENTSOE, Fetches the data, turns it into a Dataframe and returns
+    parameters["securityToken"] = TOKEN
+
+    # Convert periodStart and periodEnd to datetime objects
+    start_date = datetime.strptime(periodStart, "%Y%m%d%H%M")
+    end_date = datetime.strptime(periodEnd, "%Y%m%d%H%M")
+
+    # Initialize an empty dataframe to concatenate results
+    final_dataframe = pd.DataFrame()
+
+    # Split the requests into at most one-year intervals
+    while start_date < end_date:
+        next_end_date = min(start_date + timedelta(days=365), end_date)
+        parameters["periodStart"] = start_date.strftime("%Y%m%d%H%M")
+        parameters["periodEnd"] = next_end_date.strftime("%Y%m%d%H%M")
+
+        # Create a copy of parameters excluding the securityToken for filename creation
+        filename_parameters = {k: v for k, v in parameters.items() if k != "securityToken"}
+        # Construct the filename for the saved data
+        file_name = 'xmlFolder/' + str(filename_parameters) + '.xml'
+
+        # If the file doesn't exist, then fetch if from ENTSOE and save it
+        if not os.path.exists(file_name):
+            response = requests.get(base_url, params=parameters)
+            if response.status_code == 200:
+                if response.content.startswith(b'PK'):  # Check if the data starts with 'PK' indicating it might be a ZIP archive
+                    zip_io = io.BytesIO(response.content)  # Convert binary data to a file-like object
+                    with zipfile.ZipFile(zip_io, 'r') as z:  # Assuming the first file in the ZIP archive is XML
+                        xml_file_name = [name for name in z.namelist() if name.endswith('.xml')][0]
+                        xml_data = z.read(xml_file_name)
+                else:
+                    xml_data = response.content
+                with open(file_name, 'wb') as file:
+                    file.write(xml_data)
+            else:
+                print("The request was not successful.")
+                return None
+
+        # Read the XML data from the saved file
+        with open(file_name, 'rb') as file:
+            xml_data = file.read()
+
+        if parameters["documentType"] == documentTypes["Imbalance prices"]:
+            df = xml_to_df_ImbalancePrices(xml_data)
+        elif parameters["documentType"] == documentTypes["Imbalance volume"]:
+            df = xml_to_df_ImbalanceVolumes(xml_data)
+        else:
+            df = xml_to_df(xml_data)
+
+        final_dataframe = pd.concat([final_dataframe, df])
+        start_date = next_end_date
+
+    if len(final_dataframe) == 0:
+        print("Missing Data")
+        print("Document Type:", parameters["documentType"])
+        print("Last XML:", file_name)
+        print()
+        return final_dataframe
+    final_dataframe = final_dataframe.drop_duplicates(subset=['timestamp']).set_index('timestamp').sort_index()
+    return final_dataframe
+
+
+def fetch_Country_data(area):
+    # Define parameters for each DataFrame
+
+    parameters_DayAheadPrices = {
+        "documentType": documentTypes["Price Document"],
+        "in_Domain": areas[area],
+        "out_Domain": areas[area],
+    }
+
+    parameters_ImbalancePrices = {
+        "documentType": documentTypes["Imbalance prices"],
+        "controlArea_Domain": areas[area],
+    }
+
+    parameters_ImbalanceVolume = {
+        "documentType": documentTypes["Imbalance volume"],
+        "controlArea_Domain": areas[area],
+    }
+
+    parameters_Solar_DayAheadForecast = {
+        "documentType": documentTypes["Wind and solar forecast"],
+        "processType": processTypes["DayAhead"],
+        "psrType": psrTypes["Solar"],
+        "in_Domain": areas[area],
+    }
+
+    parameters_Solar_ActualGeneration = {
+        "documentType": documentTypes["Actual generation per type"],
+        "processType": processTypes["Realised"],
+        "psrType": psrTypes["Solar"],
+        "in_Domain": areas[area],
+    }
+
+    parameters_WindOnshore_DayAheadForecast = {
+        "documentType": documentTypes["Wind and solar forecast"],
+        "processType": processTypes["DayAhead"],
+        "psrType": psrTypes["Wind Onshore"],
+        "in_Domain": areas[area],
+    }
+
+    parameters_WindOnshore_ActualGeneration = {
+        "documentType": documentTypes["Actual generation per type"],
+        "processType": processTypes["Realised"],
+        "psrType": psrTypes["Wind Onshore"],
+        "in_Domain": areas[area],
+    }
+
+    parameters_WindOffshore_DayAheadForecast = {
+        "documentType": documentTypes["Wind and solar forecast"],
+        "processType": processTypes["DayAhead"],
+        "psrType": psrTypes["Wind Offshore"],
+        "in_Domain": areas[area],
+    }
+
+    parameters_WindOffshore_ActualGeneration = {
+        "documentType": documentTypes["Actual generation per type"],
+        "processType": processTypes["Realised"],
+        "psrType": psrTypes["Wind Offshore"],
+        "in_Domain": areas[area],
+    }
+
+    parameters_ActualTotalLoad = {
+        "documentType": documentTypes["System total load"],
+        "processType": processTypes["Realised"],
+        "outBiddingZone_Domain": areas[area],
+    }
+
+    parameters_DayAheadTotalLoadForecast = {
+        "documentType": documentTypes["System total load"],
+        "processType": processTypes["DayAhead"],
+        "outBiddingZone_Domain": areas[area],
+    }
+
+    # Fetch data
+    df_DayAheadPrice = fetch_data_from_ENTSOE(parameters_DayAheadPrices)
+    df_ImbalancePrice = fetch_data_from_ENTSOE(parameters_ImbalancePrices)
+    df_ImbalanceVolume = fetch_data_from_ENTSOE(parameters_ImbalanceVolume)
+    df_Solar_DayAheadForecast = fetch_data_from_ENTSOE(parameters_Solar_DayAheadForecast)
+    df_Solar_ActualGeneration = fetch_data_from_ENTSOE(parameters_Solar_ActualGeneration)
+    df_WindOnshore_DayAheadForecast = fetch_data_from_ENTSOE(parameters_WindOnshore_DayAheadForecast)
+    df_WindOnshore_ActualGeneration = fetch_data_from_ENTSOE(parameters_WindOnshore_ActualGeneration)
+    df_WindOffshore_DayAheadForecast = fetch_data_from_ENTSOE(parameters_WindOffshore_DayAheadForecast)
+    df_WindOffshore_ActualGeneration = fetch_data_from_ENTSOE(parameters_WindOffshore_ActualGeneration)
+    df_ActualTotalLoad = fetch_data_from_ENTSOE(parameters_ActualTotalLoad)
+    df_DayAheadTotalLoadForecast = fetch_data_from_ENTSOE(parameters_DayAheadTotalLoadForecast)
+
+    # Select and rename columns
+    df_ImbalanceVolume.rename(columns={'quantity': 'ImbalanceVolume'}, inplace=True)
+    df_DayAheadPrice.rename(columns={'quantity': 'DayAheadPrice'}, inplace=True)
+    df_ImbalancePrice.rename(columns={'quantity_Generation': 'ImbalancePrice_Generation',
+                                      'quantity_Load': 'ImbalancePrice_Load', }, inplace=True)
+    df_Solar_DayAheadForecast.rename(columns={'quantity': 'Solar_DayAheadForecast'}, inplace=True)
+    df_Solar_ActualGeneration.rename(columns={'quantity': 'Solar_ActualGeneration'}, inplace=True)
+    df_WindOnshore_DayAheadForecast.rename(columns={'quantity': 'WindOnshore_DayAheadForecast'}, inplace=True)
+    df_WindOnshore_ActualGeneration.rename(columns={'quantity': 'WindOnshore_ActualGeneration'}, inplace=True)
+    df_WindOffshore_DayAheadForecast.rename(columns={'quantity': 'WindOffshore_DayAheadForecast'}, inplace=True)
+    df_WindOffshore_ActualGeneration.rename(columns={'quantity': 'WindOffshore_ActualGeneration'}, inplace=True)
+    df_ActualTotalLoad.rename(columns={'quantity': 'ActualTotalLoad'}, inplace=True)
+    df_DayAheadTotalLoadForecast.rename(columns={'quantity': 'DayAheadTotalLoadForecast'}, inplace=True)
+
+    return {
+        "DayAheadPrice": df_DayAheadPrice,
+        "ImbalancePrice": df_ImbalancePrice,
+        "ImbalanceVolume": df_ImbalanceVolume,
+        "Solar_DayAheadForecast": df_Solar_DayAheadForecast,
+        "Solar_ActualGeneration": df_Solar_ActualGeneration,
+        "WindOnshore_DayAheadForecast": df_WindOnshore_DayAheadForecast,
+        "WindOnshore_ActualGeneration": df_WindOnshore_ActualGeneration,
+        "WindOffshore_DayAheadForecast": df_WindOffshore_DayAheadForecast,
+        "WindOffshore_ActualGeneration": df_WindOffshore_ActualGeneration,
+        "ActualTotalLoad": df_ActualTotalLoad,
+        "DayAheadTotalLoadForecast": df_DayAheadTotalLoadForecast,
+    }
+
+
+def generate_latex_file(df, filename, table_num="Table #", title="Title"):
+    num_columns = len(df.columns)
+
+    with open(filename, 'w') as f:
+        f.write("\\documentclass[12pt,a4paper]{standalone}\n")
+        f.write("\\usepackage{booktabs}\n")
+        f.write("\\usepackage{array}\n")
+        f.write("\\usepackage{tabularx}\n")
+        f.write("\\begin{document}\n")
+        f.write("\\centering\n")
+        f.write("\\fontsize{8pt}{10pt}\\selectfont\n")
+        f.write("\\small\n")
+
+        f.write("% Define a new column type for centered content with wrapping\n")
+        f.write("\\newcolumntype{Y}{>{\\centering\\arraybackslash}X}\n")
+        f.write("% Setting table width to a specific value (e.g., 190mm to fit within A4 width with some margin)\n")
+
+        column_format = "l" + "Y" * (num_columns - 1)
+        f.write("\\begin{tabularx}{190mm}{" + column_format + "}\n")
+
+        f.write("\\multicolumn{" + str(num_columns) + "}{l}{\\textbf{" + table_num + "}} \\\\\n")
+        f.write("\\multicolumn{" + str(num_columns) + "}{l}{" + title + "} \\\\\n")
+
+        f.write("\\hline\n")
+        f.write(" & ".join(df.columns).replace('%', '\\%').replace('_', '\\_') + "\\\\\n")
+        f.write("\\hline\n")
+
+        for index, row in df.iterrows():
+            formatted_row = []
+            for col in df.columns:
+                value = row[col]
+                if isinstance(value, (np.float64, float)):
+                    formatted_row.append("{:,.2f}".format(value))
+                elif isinstance(value, pd.Timestamp):
+                    formatted_row.append(str(value.date()))
+                else:
+                    formatted_row.append(str(value))
+            f.write(" & ".join(formatted_row))
+            f.write("\\\\\n")
+
+        f.write("\\hline\n")
+
+        f.write("\\end{tabularx}\n")
+        f.write("\\end{document}\n")
+
+
+#############################################################################  DATA PREPARATION
+
+
+# List of country names
+countries = ["Belgium", "France", "Germany", "Lithuania", "Netherlands", "Portugal", "Spain", "Switzerland"]
+
+# Fetch data for each country
+country_data_dict = {country: fetch_Country_data(country) for country in countries}
+
+
+def merge_dfs(df_dict):
+    # List of types to inner merge
+    types_to_merge = ['Solar', 'WindOnshore', 'WindOffshore']
+
+    # Inner merge for each type
+    merged_dfs = []
+    for t in types_to_merge:
+        day_ahead_forecast_key = f"{t}_DayAheadForecast"
+        actual_generation_key = f"{t}_ActualGeneration"
+
+        # Check if both keys are present
+        if day_ahead_forecast_key in df_dict and actual_generation_key in df_dict:
+            merged = df_dict[day_ahead_forecast_key].merge(df_dict[actual_generation_key], left_index=True, right_index=True, how='inner')
+            merged_dfs.append(merged)
+
+    merged = df_dict["DayAheadTotalLoadForecast"].merge(df_dict["ActualTotalLoad"], left_index=True, right_index=True, how='inner')
+    merged_dfs.append(merged)
+
+    merged_dfs.append(df_dict["DayAheadPrice"])
+    merged_dfs.append(df_dict["ImbalancePrice"])
+    merged_dfs.append(df_dict["ImbalanceVolume"])
+
+    # Finally, perform the outer merge on all
+    return reduce(lambda df1, df2: df1.merge(df2, left_index=True, right_index=True, how='outer'), merged_dfs)
+
+
+# Merge dataframes for each country
+master_dataframes = {country: merge_dfs(data) for country, data in country_data_dict.items()}
+
+###################################################### NETHERLANDS IMBALANCE CORRECTION
+
+# Step 1: Read the CSV file
+filepath = f"{main_path}/Data/NetherlandsImbalanceData.csv"
+df_net_TenneT = pd.read_csv(filepath,
+                            usecols=['Date', 'period_from', 'take_from_system_kWhPTE', 'feed_into_system_EURMwh', 'imbalance_kWhPTE'])
+
+# Step 2: Create a Datetime column
+df_net_TenneT['Datetime'] = pd.to_datetime(df_net_TenneT['Date'] + ' ' + df_net_TenneT['period_from'])
+df_net_TenneT.drop(columns=['Date', 'period_from'], inplace=True)
+
+# Step 3: Set Datetime as index and localize
+df_net_TenneT.set_index('Datetime', inplace=True)
+df_net_TenneT.index = df_net_TenneT.index.tz_localize('CET', ambiguous=True)  # Assuming the data is in UTC timezone
+
+# Rename columns
+df_net_TenneT.rename(columns={
+    'take_from_system_kWhPTE': 'ImbalancePrice_Load',
+    'feed_into_system_EURMwh': 'ImbalancePrice_Generation',
+    'imbalance_kWhPTE': 'ImbalanceVolume'
+}, inplace=True)
+
+df_net_TenneT['ImbalanceVolume'] = df_net_TenneT['ImbalanceVolume'] / 1000 * 4
+
+# Step 4: Merge with
+master_dataframes["Netherlands"] = master_dataframes["Netherlands"].drop(columns=['ImbalancePrice_Load', 'ImbalancePrice_Generation'])
+master_dataframes["Netherlands"] = master_dataframes["Netherlands"].merge(df_net_TenneT, how='inner', left_index=True, right_index=True)
+
+############################################################ GERMANY IMBALANCE CORRECTION
+
+# Step 1: Read the CSV file for Imbalance_Volume
+filepath_volume = f"{main_path}/Data/NRV-Saldo 20200101-20230601.csv"
+df_germany_nrv_saldo = pd.read_csv(filepath_volume, delimiter=";", decimal=',', usecols=['Datum', 'von', 'Deutschland', "Zeitzone"])
+
+# Remove 'A' and 'B' from the 'von' column that is due to summertimezone change
+df_germany_nrv_saldo["von"] = df_germany_nrv_saldo["von"].str.replace(r'\D', '', regex=True)
+timezone_map = {"CEST": "+02:00", "CET": "+01:00"}
+df_germany_nrv_saldo["timezone_offset"] = df_germany_nrv_saldo["Zeitzone"].map(timezone_map)
+df_germany_nrv_saldo['datetime'] = pd.to_datetime(
+    df_germany_nrv_saldo['Datum'] + 'T' + df_germany_nrv_saldo['von'] + df_germany_nrv_saldo['timezone_offset'])
+
+# Step 3: Set Datetime as index and localize
+df_germany_nrv_saldo.set_index('datetime', inplace=True)
+
+# Rename column
+df_germany_nrv_saldo.rename(columns={'Deutschland': 'ImbalanceVolume'}, inplace=True)
+# Correct Sign
+df_germany_nrv_saldo['ImbalanceVolume'] = df_germany_nrv_saldo['ImbalanceVolume'] * -1
+
+directory_path = f'{main_path}/Data'
+prefix = 'reBAP ueberdeckt'
+price_files = [f for f in os.listdir(directory_path) if f.startswith(prefix)]
+df_ReBAP_list = []
+for file in price_files:
+    filepath = os.path.join(directory_path, file)
+    df_ReBAP = pd.read_csv(filepath, delimiter=";", decimal=',', usecols=['Datum', 'von', 'reBAP ueberdeckt', "Zeitzone"])
+
+    # Create a Datetime column
+    df_ReBAP["von"] = df_ReBAP["von"].str.replace(r'\D', '', regex=True)
+    timezone_map = {"CEST": "+02:00", "CET": "+01:00"}
+    df_ReBAP["timezone_offset"] = df_ReBAP["Zeitzone"].map(timezone_map)
+    df_ReBAP['datetime'] = pd.to_datetime(df_ReBAP['Datum'] + 'T' + df_ReBAP['von'] + df_ReBAP['timezone_offset'])
+
+    # Set Datetime as index and localize
+    df_ReBAP.set_index('datetime', inplace=True)
+
+    df_ReBAP.rename(columns={'reBAP ueberdeckt': 'ImbalancePrice_Load'}, inplace=True)
+    df_ReBAP["ImbalancePrice_Generation"] = df_ReBAP["ImbalancePrice_Load"]
+    df_ReBAP_list.append(df_ReBAP)
+
+df_ReBAP = pd.concat(df_ReBAP_list)
+df_ReBAP.sort_index(inplace=True)
+
+master_dataframes["Germany"] = master_dataframes["Germany"].drop(
+    columns=['ImbalanceVolume', 'ImbalancePrice_Load', 'ImbalancePrice_Generation'])
+master_dataframes["Germany"] = master_dataframes["Germany"].merge(df_germany_nrv_saldo[['ImbalanceVolume']], how='left', left_index=True,
+                                                                  right_index=True)
+master_dataframes["Germany"] = master_dataframes["Germany"].merge(df_ReBAP[['ImbalancePrice_Load', 'ImbalancePrice_Generation']],
+                                                                  how='inner', left_index=True, right_index=True)
+
+############################################################ CORRECTION FOR MISSING RENEWABLE GENERATION DATA
+
+master_dataframes['Netherlands'].drop(columns=["WindOffshore_ActualGeneration", "WindOffshore_DayAheadForecast",
+                                               "WindOnshore_ActualGeneration", "WindOnshore_DayAheadForecast",
+                                               "Solar_ActualGeneration", "Solar_DayAheadForecast"], inplace=True)
+master_dataframes['Portugal'].drop(columns=["WindOffshore_ActualGeneration", "WindOffshore_DayAheadForecast"], inplace=True)
+master_dataframes['Switzerland'].drop(columns=["WindOnshore_ActualGeneration", "WindOnshore_DayAheadForecast",
+                                               "Solar_ActualGeneration", "Solar_DayAheadForecast"], inplace=True)
+
+#############################################################################  CALCULATION OF SPREADS
+
+
+for country, df in master_dataframes.items():
+    # Calculate PriceSpread
+    df['PriceSpread'] = (df['ImbalancePrice_Generation'] + df['ImbalancePrice_Load']) / 2 - df['DayAheadPrice']
+    df['PriceSpread_Generation'] = df['ImbalancePrice_Generation'] - df['DayAheadPrice']
+    df['PriceSpread_Load'] = df['ImbalancePrice_Load'] - df['DayAheadPrice']
+    df['LoadForecastError'] = df['DayAheadTotalLoadForecast'] - df['ActualTotalLoad']
+
+
+#############################################################################  DATA EXPLORATION PLOT
+
+def plot_for_country(country, df):
+    def add_table_below_ax(ax, data):
+        # Create a table and add it below the plot
+        stats = data.describe()
+        table_data = []
+        columns = data.columns
+        rows = ["count", "mean", "std", "min", "25%", "50%", "75%", "max"]
+
+        for col in columns:
+            values = stats[col].values
+            # Format count as integer
+            col_data = []
+            col_data.append(int(values[0]))
+            # Format other values with two decimals and thousand separators
+            for i in range(1, len(values)):
+                col_data.append("{:,.2f}".format(values[i]))
+            table_data.append(col_data)
+
+        table = ax.table(cellText=table_data, rowLabels=columns, colLabels=rows, loc='bottom', cellLoc='right', colLoc='right',
+                         edges='horizontal', bbox=[0.285, -0.35, 0.7, 0.35])
+        table.set_fontsize(8)
+
+    fig, axs = plt.subplots(7, 1, figsize=(10, 18), sharex=True)
+
+    # 1. DayAheadPrice
+    axs[0].plot(df['DayAheadPrice'], alpha=0.7)
+    axs[0].set_title('DayAheadPrice (€)', loc='left')
+    axs[0].grid(True, axis='x')
+    add_table_below_ax(axs[0], df[['DayAheadPrice']])
+
+    # 2. ImbalancePrice
+    axs[1].plot(df['ImbalancePrice_Generation'], alpha=0.7, label='ImbalancePrice_Generation')
+    axs[1].plot(df['ImbalancePrice_Load'], alpha=0.7, label='ImbalancePrice_Load')
+    axs[1].set_title('ImbalancePrice (€)', loc='left')
+    axs[1].grid(True, axis='x')
+    axs[1].legend(loc='upper right')
+    add_table_below_ax(axs[1], df[['ImbalancePrice_Generation', 'ImbalancePrice_Load']])
+
+    # 3. ImbalanceVolume
+    axs[2].set_title('ImbalanceVolume (MW)', loc='left')
+    axs[2].grid(True, axis='x')
+    if 'ImbalanceVolume' in df.columns:
+        axs[2].plot(df['ImbalanceVolume'], alpha=0.7)
+        add_table_below_ax(axs[2], df[['ImbalanceVolume']])
+
+    # 4. Solar_ActualGeneration and Solar_DayAheadForecast
+    axs[3].set_title('Solar Generation (MW)', loc='left')
+    axs[3].grid(True, axis='x')
+    if 'Solar_ActualGeneration' in df.columns and 'Solar_DayAheadForecast' in df.columns:
+        axs[3].plot(df['Solar_ActualGeneration'], alpha=0.7, label='ActualGeneration')
+        axs[3].plot(df['Solar_DayAheadForecast'], alpha=0.7, linestyle='--', label='DayAheadForecast')
+        axs[3].legend(loc='upper right')
+        add_table_below_ax(axs[3], df[['Solar_ActualGeneration', 'Solar_DayAheadForecast']])
+
+    # 5. WindOnshore_ActualGeneration and WindOnshore_DayAheadForecast
+    axs[4].set_title('Wind Onshore Generation (MW)', loc='left')
+    axs[4].grid(True, axis='x')
+    if 'WindOnshore_ActualGeneration' in df.columns and 'WindOnshore_DayAheadForecast' in df.columns:
+        axs[4].plot(df['WindOnshore_ActualGeneration'], alpha=0.7, label='ActualGeneration')
+        axs[4].plot(df['WindOnshore_DayAheadForecast'], alpha=0.7, linestyle='--', label='DayAheadForecast')
+        axs[4].legend(loc='upper right')
+        add_table_below_ax(axs[4], df[['WindOnshore_ActualGeneration', 'WindOnshore_DayAheadForecast']])
+
+    # 6. WindOffshore_ActualGeneration and WindOffshore_DayAheadForecast
+    axs[5].set_title('Wind Offshore Generation (MW)', loc='left')
+    axs[5].grid(True, axis='x')
+    if 'WindOffshore_ActualGeneration' in df.columns and 'WindOffshore_DayAheadForecast' in df.columns:
+        axs[5].plot(df['WindOffshore_ActualGeneration'], alpha=0.7, label='ActualGeneration')
+        axs[5].plot(df['WindOffshore_DayAheadForecast'], alpha=0.7, linestyle='--', label='DayAheadForecast')
+        axs[5].legend(loc='upper right')
+        add_table_below_ax(axs[5], df[['WindOffshore_ActualGeneration', 'WindOffshore_DayAheadForecast']])
+
+    # 7. ActualTotalLoad and DayAheadLoadForecast
+    axs[6].set_title('Load (MW)', loc='left')
+    axs[6].grid(True, axis='x')
+    if 'ActualTotalLoad' in df.columns and 'DayAheadTotalLoadForecast' in df.columns:
+        axs[6].plot(df['ActualTotalLoad'], alpha=0.7, label='ActualLoad')
+        axs[6].plot(df['DayAheadTotalLoadForecast'], alpha=0.7, linestyle='--', label='DayAheadForecast')
+        axs[6].legend(loc='upper right')
+        add_table_below_ax(axs[6], df[['ActualTotalLoad', 'DayAheadTotalLoadForecast']])
+
+    # Format x-axis to show each month
+    months = mdates.MonthLocator(interval=1)
+    months_fmt = mdates.DateFormatter('%Y-%m')
+    axs[6].xaxis.set_major_locator(months)
+    axs[6].xaxis.set_major_formatter(months_fmt)
+    axs[6].tick_params(axis='x',
+                       rotation=90,
+                       which='major', pad=45)
+
+    # Set common labels
+    fig.suptitle(f'{country} Dataset Exploration', fontsize=14
+                 # , y=0.5
+                 )  # main title
+
+    plt.tight_layout()
+    plt.subplots_adjust(hspace=0.6)  # Adjust spacing as needed
+    plt.savefig(f"{main_path}/Appendix/Data_Exploration_{country}.png", dpi=200)
+    plt.close()  # Close the current figure after saving
+
+
+# Plot for each country
+for country, df in master_dataframes.items():
+    plot_for_country(country, df)
+    print("Plotted", country)
+
+
+#############################################################################  BOX PLOTTING PRICE SPREADS
+
+
+def plot_spreads(dataframe, country_name):
+    # Winsorize the data and create a dictionary for boxplot
+    data_dict = {
+        'Upward:\nLoad': winsorize(dataframe['PriceSpread_Load'][dataframe['ImbalanceVolume'] < 0], limits=0.025),
+        'Upward:\nGeneration': winsorize(dataframe['PriceSpread_Generation'][dataframe['ImbalanceVolume'] < 0], limits=0.025),
+        'Downward:\nLoad': winsorize(dataframe['PriceSpread_Load'][dataframe['ImbalanceVolume'] > 0], limits=0.025),
+        'Downward:\nGeneration': winsorize(dataframe['PriceSpread_Generation'][dataframe['ImbalanceVolume'] > 0], limits=0.025),
+    }
+
+    # Create a figure and axis for each country
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Create a boxplot for each series in the data dictionary
+    sns.boxplot(data=list(data_dict.values()), ax=ax, orient="h", palette="Set2", boxprops=dict(alpha=.5))
+
+    # Set the ytick labels from dictionary keys
+    ax.set_yticklabels(data_dict.keys(), rotation=0, va='center', fontsize=8)
+    ax.set_title(f'Imbalance Direction: Price Category', loc='left', fontsize=8)
+
+    # Set labels
+    ax.set_xlabel('Winsorized Price Spread (€)', fontsize=8)
+    # ax.set_ylabel('Imbalance Direction: Price Category', fontsize=10)
+
+    fig.suptitle(f'{country_name} DAP-To-Imbalance Price Spread Box-Plot', fontsize=12)
+    plt.tight_layout()
+    # Save the plot
+    plt.savefig(f"{main_path}/Appendix/Winsorized_Price_Spread_Box-Plot_{country_name}.png", dpi=200)
+    plt.close()  # Close the current figure after saving
+
+
+# Loop through each country in the dictionary and plot
+for country, dataframe in master_dataframes.items():
+    plot_spreads(dataframe, country)
+
+
+#############################################################################  GENERATE TABLE: Balancing Price Tail Deviation Index
+
+def generateTable_BPTDI(dataframes, target_date):
+    """
+    Calculate the Balancing Price Tail Deviation Index (BPTDI) for each country dataframe
+    and outputs the results as a LaTeX table.
+
+    Parameters:
+    - dataframes (dict): Dictionary containing country dataframes.
+    - target_date (str): The date for which the metric should be calculated.
+
+    Returns:
+    - None
+    """
+
+    # Convert the date string into a Timestamp with timezone
+    specific_date = pd.Timestamp(target_date).tz_localize('Europe/Berlin')
+    results = []
+
+    for country, df in dataframes.items():
+        start_time = specific_date - pd.DateOffset(years=1)
+        df_subset = df[start_time:specific_date].copy()
+
+        # Calculations
+        var_5 = df_subset["PriceSpread"].quantile(0.05)
+        var_95 = df_subset["PriceSpread"].quantile(0.95)
+        es_5 = df_subset[df_subset["PriceSpread"] <= var_5]["PriceSpread"].mean()
+        es_95 = df_subset[df_subset["PriceSpread"] >= var_95]["PriceSpread"].mean()
+        risk_value = (abs(es_5) + abs(es_95)) / 2
+
+        results.append({
+            "Country": country,
+            "ES 5% (€/MWh)": es_5,
+            "VaR 5% (€/MWh)": var_5,
+            "VaR 95% (€/MWh)": var_95,
+            "ES 95% (€/MWh)": es_95,
+            "Risk Value (€/MWh)": risk_value
+        })
+
+    risk_df = pd.DataFrame(results)
+
+    generate_latex_file(risk_df,
+                        f'{main_path}/Appendix/Tables/Balancing Price Tail Deviation Index Table.tex',
+                        "Table 1",
+                        f"Balancing Price Tail Deviation Index - {target_date}")
+
+
+generateTable_BPTDI(master_dataframes, "2023-06-01")
+
+
+#############################################################################  GENERATE PLOT: Balancing Price Tail Deviation Index
+
+def plotTimeSeries_BPTDI(dataframes, start_date="2021-01-01", end_date="2023-06-01"):
+    """
+    Plot the daily BPTDI values for each country over a given date range.
+
+    Parameters:
+    - dataframes (dict): Dictionary containing country dataframes.
+    - start_date (str): Start date for the calculation. Defaults to "2021-01-01".
+    - end_date (str): End date for the calculation. Defaults to "2023-06-01".
+
+    Returns:
+    - None
+    """
+
+    # Preparing dates
+    dates_to_calculate = pd.date_range(start=start_date, end=end_date, freq='D', tz='Europe/Berlin')
+    time_series_data = {country: [] for country in dataframes.keys()}
+
+    for country, df in dataframes.items():
+        for date in dates_to_calculate:
+            start_time = date - pd.DateOffset(years=1)
+            df_subset = df[start_time:date].copy()
+            # Calculations
+            var_5 = df_subset["PriceSpread"].quantile(0.05)
+            var_95 = df_subset["PriceSpread"].quantile(0.95)
+            es_5 = df_subset[df_subset["PriceSpread"] <= var_5]["PriceSpread"].mean()
+            es_95 = df_subset[df_subset["PriceSpread"] >= var_95]["PriceSpread"].mean()
+            risk_value = (abs(es_5) + abs(es_95)) / 2
+
+            time_series_data[country].append(risk_value)
+
+    # Plotting
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for country, values in time_series_data.items():
+        ax.plot(dates_to_calculate, values, label=country, alpha=0.7)
+    ax.set_title('Risk Value (€/MWh) by Country', loc='left')
+    ax.grid(True, axis='x')
+
+    # Format x-axis
+    months = mdates.MonthLocator()
+    months_fmt = mdates.DateFormatter('%Y-%m')
+    ax.xaxis.set_major_locator(months)
+    ax.xaxis.set_major_formatter(months_fmt)
+    ax.tick_params(axis='x', rotation=45)
+
+    fig.suptitle('Balancing Price Tail Deviation Index Time-Series Plot', fontsize=14)
+
+    plt.tight_layout()
+    plt.legend()
+    # Save the plot
+    plt.savefig(f"{main_path}/Appendix/Metric Time-Series BPTDI.png", dpi=200)
+    plt.close()  # Close the current figure after saving
+
+
+plotTimeSeries_BPTDI(master_dataframes, start_date="2021-01-01", end_date="2023-06-01")
+
+
+#############################################################################  GENERATE TABLE: Directional Imbalance Price Deviation Index
+
+
+def generateTable_DIPDI(dataframes, target_date):
+    """
+    Calculate the Directional Imbalance Price Deviation Index (DIPDI) for a specific date
+    and create a DataFrame suitable for conversion to a LaTeX table.
+
+    Parameters:
+    - dataframes (dict): Dictionary containing country dataframes.
+    - specific_date_str (str): Specific date for which the risk value is calculated.
+
+    Returns:
+    - pd.DataFrame: DataFrame containing DIPDI results for the provided date.
+    """
+
+    specific_date = pd.Timestamp(target_date).tz_localize('Europe/Berlin')
+    results = []
+
+    for country, df in dataframes.items():
+        start_time = specific_date - pd.DateOffset(years=1)
+        df_subset = df[start_time:specific_date].copy()
+
+        df_upward = df_subset[df_subset["ImbalanceVolume"] < 0]
+        df_downward = df_subset[df_subset["ImbalanceVolume"] > 0]
+
+        # Calculations
+
+        upwardLoad_quantile_95 = df_upward["PriceSpread_Load"].quantile(0.95)
+        downwardGeneration_quantile_5 = df_downward["PriceSpread_Generation"].quantile(0.05)
+
+        upwardLoad_es_95 = df_upward[df_upward["PriceSpread_Load"] >= upwardLoad_quantile_95]["PriceSpread_Load"].mean()
+        downwardGeneration_es_5 = df_downward[df_downward["PriceSpread_Generation"] <= downwardGeneration_quantile_5][
+            "PriceSpread_Generation"].mean()
+
+        risk_value = (abs(downwardGeneration_es_5) + abs(upwardLoad_es_95)) / 2
+
+        results.append({
+            "Country": country,
+
+            "Downward Generation\n ES5%(€/MWh)": downwardGeneration_es_5,
+            "Downward Generation\n VaR5%(€/MWh)": downwardGeneration_quantile_5,
+            "Upward Load\n VaR95%(€/MWh)": upwardLoad_quantile_95,
+            "Upward Load\n ES95%(€/MWh)": upwardLoad_es_95,
+            "Risk Value (€/MWh)": risk_value
+        })
+
+    risk_df = pd.DataFrame(results)
+
+    generate_latex_file(risk_df,
+                        f'{main_path}/Appendix/Tables/Directional Imbalance Price Deviation Index Table.tex',
+                        "Table 2",
+                        f"Directional Imbalance Price Deviation Index - {target_date}")
+
+
+generateTable_DIPDI(master_dataframes, "2023-06-01")
+
+
+#############################################################################  GENERATE PLOT: Directional Imbalance Price Deviation Index
+
+
+def plotTimeSeries_DIPDI(dataframes, start_date="2021-01-01", end_date="2023-06-01"):
+    """
+    Plot the Directional Imbalance Price Deviation Index (DIPDI) time series for all countries.
+
+    Parameters:
+    - dataframes (dict): Dictionary containing country dataframes.
+    - start_date (str): Start date for the time series.
+    - end_date (str): End date for the time series.
+    """
+
+    dates_to_calculate = pd.date_range(start=start_date, end=end_date, freq='D', tz='Europe/Berlin')
+    time_series_data = {country: [] for country in dataframes.keys()}
+
+    for country, df in dataframes.items():
+        for date in dates_to_calculate:
+            start_time = date - pd.DateOffset(years=1)
+            df_subset = df[start_time:date].copy()
+
+            df_upward = df_subset[df_subset["ImbalanceVolume"] < 0]
+            df_downward = df_subset[df_subset["ImbalanceVolume"] > 0]
+
+            upwardLoad_quantile_95 = df_upward["PriceSpread_Load"].quantile(0.95)
+            downwardGeneration_quantile_5 = df_downward["PriceSpread_Generation"].quantile(0.05)
+
+            upwardLoad_es_95 = df_upward[df_upward["PriceSpread_Load"] >= upwardLoad_quantile_95]["PriceSpread_Load"].mean()
+            downwardGeneration_es_5 = df_downward[df_downward["PriceSpread_Generation"] <= downwardGeneration_quantile_5][
+                "PriceSpread_Generation"].mean()
+
+            risk_value = (abs(downwardGeneration_es_5) + abs(upwardLoad_es_95)) / 2
+
+            time_series_data[country].append(risk_value)
+
+    # Plotting
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for country, values in time_series_data.items():
+        ax.plot(dates_to_calculate, values, label=country, alpha=0.7)
+
+    ax.set_title('DIPDI Value (€/MWh) by Country', loc='left')
+    ax.grid(True, axis='x')
+
+    # Format x-axis
+    months = mdates.MonthLocator()
+    months_fmt = mdates.DateFormatter('%Y-%m')
+    ax.xaxis.set_major_locator(months)
+    ax.xaxis.set_major_formatter(months_fmt)
+    ax.tick_params(axis='x', rotation=45)
+
+    fig.suptitle('Directional Imbalance Price Deviation Index Time-Series Plot', fontsize=14)
+
+    plt.tight_layout()
+    plt.legend()
+    # Save the plot
+    plt.savefig(f"{main_path}/Appendix/Metric Time-Series DIPDI.png", dpi=200)
+    plt.close()  # Close the current figure after saving
+
+
+plotTimeSeries_DIPDI(master_dataframes, start_date="2021-01-01", end_date="2023-06-01")
+
+
+#############################################################################  GENERATE TABLE: Extreme Imbalance Deviation Balancing Price Impact
+
+
+def generateTable_EIDBPI(dataframes, target_date):
+    """
+    Calculate the Extreme Imbalance Deviation Balancing Price Impact (EID-BPI) for each country dataframe
+    and outputs the results as a LaTeX table.
+
+    Parameters:
+    - dataframes (dict): Dictionary containing country dataframes.
+    - target_date (str): The date for which the metric should be calculated.
+
+    Returns:
+    - None
+    """
+
+    # Convert the date string into a Timestamp with timezone
+    specific_date = pd.Timestamp(target_date).tz_localize('Europe/Berlin')
+    results = []
+
+    for country, df in dataframes.items():
+        start_time = specific_date - pd.DateOffset(years=1)
+        df_subset = df[start_time:specific_date].copy()
+
+        PriceSpreads = abs(df_subset['PriceSpread'])
+        ImbalanceVolumes = abs(df_subset['ImbalanceVolume'])
+
+        # Step 1: Filter Price Spreads during Extreme Errors
+        threshold = ImbalanceVolumes.quantile(0.95)
+        PriceSpreads_extreme = PriceSpreads[ImbalanceVolumes > threshold]
+        PriceSpreads_nonExtreme = PriceSpreads[ImbalanceVolumes < threshold]
+
+        # Step 2: Calculate Basic Statistics
+        sigma = PriceSpreads.std()
+        X_bar = PriceSpreads.mean()
+        X1_bar = PriceSpreads_extreme.mean()
+        X2_bar = PriceSpreads_nonExtreme.mean()
+
+        # Step 3: Compute Z-Scores for Extreme Price Spreads
+        Z_Scores_extreme = (PriceSpreads_extreme - X_bar) / sigma
+
+        # Step 4: Aggregate the Z-Scores
+        EIDBPI_ZMean = Z_Scores_extreme.mean()
+        EIDBPI_ZVariance = Z_Scores_extreme.var()
+
+        # Step 5: Constructing the Normalized EID-BPI
+        w = 0.33
+        riskValue = w * EIDBPI_ZMean + (1 - w) * EIDBPI_ZVariance
+
+        results.append({
+            "Country": country,
+            "Mean - Extremes": X1_bar,
+            "Mean - Nonextremes": X2_bar,
+            "Mean - Overall": X_bar,
+            "Deviation - Overall": sigma,
+            "EID-BPI Z-Mean": EIDBPI_ZMean,
+            "EID-BPI Z-Variance": EIDBPI_ZVariance,
+            "Risk Value": riskValue,
+        })
+
+    EIDBPI_df = pd.DataFrame(results)
+
+    generate_latex_file(EIDBPI_df,
+                        f'{main_path}/Appendix/Tables/Extreme Imbalance Deviation Balancing Price Impact Table.tex',
+                        "Table 3",
+                        f"Extreme Imbalance Deviation Balancing Price Impact - {target_date}")
+
+
+generateTable_EIDBPI(master_dataframes, "2023-06-01")
+
+
+#############################################################################  GENERATE TABLE: Day-Ahead Stochastic Strategy Balancing Cashflow Impact
+
+
+def generateTable_DASS_BCI(dataframes, target_date):
+    """
+    Calculate the Day-Ahead Stochastic Strategy Balancing Price Impact (DASS-BCI) for a specific date
+    and create a DataFrame suitable for conversion to a LaTeX table.
+
+    Parameters:
+    - dataframes (dict): Dictionary containing country dataframes.
+    - target_date (str): Specific date for which the DASS-BCI is calculated.
+
+    Returns:
+    - pd.DataFrame: DataFrame containing DASS-BCI results for the provided date.
+    """
+
+    specific_date = pd.Timestamp(target_date).tz_localize('Europe/Berlin')
+    results = []
+
+    for country, df in dataframes.items():
+        start_time = specific_date - pd.DateOffset(years=1)
+        df_subset = df[start_time:specific_date].copy()
+
+        renewable_sources = ["Solar", "WindOnshore", "WindOffshore"]
+        available_sources = [source for source in renewable_sources if
+                             (source + "_ActualGeneration" in df_subset.columns and source + "_DayAheadForecast" in df_subset.columns)]
+
+        df_subset["ForecastedGeneration"] = df_subset[[source + "_DayAheadForecast" for source in available_sources]].sum(axis=1)
+        df_subset["ActualGeneration"] = df_subset[[source + "_ActualGeneration" for source in available_sources]].sum(axis=1)
+
+        df_subset["ForecastErrorPercentage"] = abs(
+            (df_subset["ForecastedGeneration"] - df_subset["ActualGeneration"]) / (
+                        df_subset["ActualGeneration"] + df_subset["ForecastedGeneration"])) * 200
+
+        df_subset["PriceSpreadAbs"] = abs(df_subset["PriceSpread"])
+
+        # Calculate DASS-BCI for each quarter-hour
+        df_subset["QuarterHourly_DASS_BCI"] = (df_subset["PriceSpreadAbs"] * df_subset["ForecastErrorPercentage"])
+
+        # Aggregate to get final DASS-BCI for the year up to the specific date
+        avg_ForecastErrorPercentage = df_subset["ForecastErrorPercentage"].mean()
+        avg_PriceSpreadAbs = df_subset["PriceSpreadAbs"].mean()
+
+        final_DASS_BCI = df_subset["QuarterHourly_DASS_BCI"].mean()
+
+        results.append({
+            "Country": country,
+            "Average Forecast Error Percentage": avg_ForecastErrorPercentage,
+            "Average Absolute Price Spreads": avg_PriceSpreadAbs,
+            "DASS-BCI": final_DASS_BCI,
+            "DASS-BCI Normalized": final_DASS_BCI / avg_PriceSpreadAbs / avg_ForecastErrorPercentage
+        })
+
+    risk_df = pd.DataFrame(results)
+
+    generate_latex_file(risk_df,
+                        f'{main_path}/Appendix/Tables/Day-Ahead Stochastic Strategy Balancing Price Impact Table.tex',
+                        "Table 4",
+                        f"Day-Ahead Stochastic Strategy Balancing Price Impact - {target_date}")
+    return df_subset
+
+
+# Sample usage:
+master_dataframes_withoutSwitzerland = master_dataframes.copy()
+master_dataframes_withoutSwitzerland.pop("Switzerland")
+master_dataframes_withoutSwitzerland.pop("Netherlands")
+
+a = generateTable_DASS_BCI(master_dataframes_withoutSwitzerland, "2023-06-01")
+
+
+#############################################################################  GENERATE TABLE: DayAhead Load Forecast Accuracy Index
+
+
+def generateTable_DLFAI(dataframes, target_date):
+    """
+    Calculate the DayAhead Load Forecast Accuracy Index (DLFAI) for each country dataframe
+    and outputs the results as a LaTeX table.
+
+    Parameters:
+    - dataframes (dict): Dictionary containing country dataframes.
+    - target_date (str): The date for which the metric should be calculated.
+
+    Returns:
+    - None
+    """
+
+    # Convert the date string into a Timestamp with timezone
+    specific_date = pd.Timestamp(target_date).tz_localize('Europe/Berlin')
+    results = []
+
+    for country, df in dataframes.items():
+        start_time = specific_date - pd.DateOffset(years=1)
+        df_subset = df[start_time:specific_date].copy()
+
+        # Calculate the Mean Absolute Percentage Error (MAPE)
+        actual_values = df_subset['ActualTotalLoad']
+        forecasted_values = df_subset['DayAheadTotalLoadForecast']
+
+        forecast_errors = (actual_values - forecasted_values) / actual_values
+
+        mape = (abs((actual_values - forecasted_values) / actual_values).mean()) * 100
+
+        # Compute the Forecast Accuracy Index (DLFAI)
+        DLFAI = 100 - mape
+
+        results.append({
+            "Country": country,
+            "Mean of Absolute Forecast Errors": abs(forecast_errors).mean(),
+            "Deviation of Forecast Errors": forecast_errors.std(),
+            "DLFAI": DLFAI,
+        })
+
+    DLFAI_df = pd.DataFrame(results)
+
+    generate_latex_file(DLFAI_df,
+                        f'{main_path}/Appendix/Tables/DayAhead Load Forecast Accuracy Index Table.tex',
+                        "Table 5",
+                        f"DayAhead Load Forecast Accuracy Index - {target_date}")
+
+
+generateTable_DLFAI(master_dataframes, "2023-06-01")
+
+
+#############################################################################  GENERATE PLOT: DayAhead Load Forecast Accuracy Index
+
+
+def plotTimeSeries_DLFAI(dataframes, start_date="2021-01-01", end_date="2023-06-01"):
+    """
+    Plot the DayAhead Load Forecast Accuracy Index (DLFAI) time series for all countries.
+
+    Parameters:
+    - dataframes (dict): Dictionary containing country dataframes.
+    - start_date (str): Start date for the time series.
+    - end_date (str): End date for the time series.
+    """
+
+    dates_to_calculate = pd.date_range(start=start_date, end=end_date, freq='D', tz='Europe/Berlin')
+    time_series_data = {country: [] for country in dataframes.keys()}
+
+    for country, df in dataframes.items():
+        for date in dates_to_calculate:
+            start_time = date - pd.DateOffset(years=1)
+            df_subset = df[start_time:date].copy()
+
+            # Calculate the Mean Absolute Percentage Error (MAPE)
+            actual_values = df_subset['ActualTotalLoad']
+            forecasted_values = df_subset['DayAheadTotalLoadForecast']
+
+            mape = (abs((actual_values - forecasted_values) / actual_values).mean()) * 100
+
+            # Compute the Forecast Accuracy Index (DLFAI)
+            fai = 100 - mape
+
+            time_series_data[country].append(fai)
+
+    # Plotting
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for country, values in time_series_data.items():
+        ax.plot(dates_to_calculate, values, label=country, alpha=0.7)
+
+    ax.set_title('FAI Value by Country', loc='left')
+    ax.grid(True, axis='x')
+
+    # Format x-axis
+    months = mdates.MonthLocator()
+    months_fmt = mdates.DateFormatter('%Y-%m')
+    ax.xaxis.set_major_locator(months)
+    ax.xaxis.set_major_formatter(months_fmt)
+    ax.tick_params(axis='x', rotation=45)
+
+    fig.suptitle('DayAhead Load Forecast Accuracy Index Time-Series Plot', fontsize=14)
+
+    plt.tight_layout()
+    plt.legend(loc='upper left')
+    # Save the plot
+    plt.savefig(f"{main_path}/Appendix/Metric Time-Series DLFAI.png", dpi=200)
+    plt.close()  # Close the current figure after saving
+
+
+plotTimeSeries_DLFAI(master_dataframes, start_date="2021-01-01", end_date="2023-06-01")
